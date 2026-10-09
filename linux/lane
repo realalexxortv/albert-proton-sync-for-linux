@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""Lane — one-way folder upload into Proton Drive for Linux.
+
+`lane setup` writes your config, makes sure rclone has a Proton remote, and
+installs a per-user systemd service. `lane run` is what that service starts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import fnmatch
+import json
+import os
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+IN_MODIFY = 0x00000002
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_Q_OVERFLOW = 0x00004000
+IN_NONBLOCK = 0x00000800
+IN_ONLYDIR = 0x01000000
+MASK = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
+
+DEFAULT_IGNORE = [".*", "*.tmp", "*.partial", "*~", ".#*"]
+STOP = False
+
+UNIT = """[Unit]
+Description=Lane one-way Proton Drive folder sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lane run
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"""
+
+DESKTOP = """[Desktop Entry]
+Type=Application
+Name=Lane
+Comment=Set up one-way Proton Drive folder sync
+Exec=sh -c 'exec "$HOME/.local/bin/lane" status'
+Terminal=true
+Categories=Network;FileTransfer;
+"""
+
+
+def log(msg: str) -> None:
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"{stamp} {msg}", flush=True)
+
+
+def handle_stop(signum, frame):  # noqa: ARG001
+    global STOP
+    STOP = True
+
+
+def config_path() -> Path:
+    override = os.environ.get("LANE_CONFIG")
+    if override:
+        return Path(override)
+    return Path.home() / ".config" / "lane" / "config.json"
+
+
+def unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / "lane.service"
+
+
+def desktop_path() -> Path:
+    return Path.home() / ".local" / "share" / "applications" / "lane.desktop"
+
+
+def bin_path() -> Path:
+    return Path.home() / ".local" / "bin" / "lane"
+
+
+def load() -> dict:
+    path = config_path()
+    with path.open(encoding="utf-8") as handle:
+        cfg = json.load(handle)
+    mode = cfg.get("mode", "copy")
+    if mode not in ("copy", "sync"):
+        raise SystemExit(f"mode must be copy or sync, not {mode!r}")
+    local = Path(cfg["local"]).expanduser()
+    ignore = cfg.get("ignore") or list(DEFAULT_IGNORE)
+    if not isinstance(ignore, list):
+        raise SystemExit("ignore must be a list of globs")
+    debounce = float(cfg.get("debounce_seconds", 3))
+    retries = int(cfg.get("retries", 5))
+    if debounce < 0.2:
+        raise SystemExit("debounce_seconds is too small")
+    if retries < 1:
+        raise SystemExit("retries must be at least 1")
+    return {
+        "local": local,
+        "remote": str(cfg["remote"]),
+        "mode": mode,
+        "ignore": [str(item) for item in ignore],
+        "debounce_seconds": debounce,
+        "retries": retries,
+        "rclone": str(cfg.get("rclone") or "rclone"),
+    }
+
+
+def ignored(rel: str, patterns: list[str]) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(rel, pattern) for pattern in patterns)
+
+
+def snapshot(root: Path, patterns: list[str]) -> dict[str, tuple[int, int]]:
+    found: dict[str, tuple[int, int]] = {}
+    if not root.exists():
+        return found
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if not ignored(name, patterns)]
+        for name in filenames:
+            path = Path(dirpath) / name
+            rel = path.relative_to(root).as_posix()
+            if ignored(rel, patterns):
+                continue
+            try:
+                st = path.stat()
+            except FileNotFoundError:
+                continue
+            found[rel] = (st.st_mtime_ns, st.st_size)
+    return found
+
+
+class Inotify:
+    def __init__(self, root: Path):
+        libname = ctypes.util.find_library("c") or "libc.so.6"
+        self.libc = ctypes.CDLL(libname, use_errno=True)
+        self.libc.inotify_init1.argtypes = [ctypes.c_int]
+        self.libc.inotify_init1.restype = ctypes.c_int
+        self.libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        self.libc.inotify_add_watch.restype = ctypes.c_int
+        self.fd = self.libc.inotify_init1(IN_NONBLOCK)
+        if self.fd < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+        self.wds: dict[int, Path] = {}
+        self.add_tree(root)
+
+    def add_dir(self, path: Path) -> None:
+        wd = self.libc.inotify_add_watch(self.fd, os.fsencode(path), MASK | IN_ONLYDIR)
+        if wd >= 0:
+            self.wds[wd] = path
+
+    def add_tree(self, root: Path) -> None:
+        for dirpath, _dirnames, _filenames in os.walk(root):
+            self.add_dir(Path(dirpath))
+
+    def poll(self, timeout: float, patterns: list[str]) -> bool:
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return False
+        changed = False
+        try:
+            data = os.read(self.fd, 65536)
+        except BlockingIOError:
+            return False
+        off = 0
+        while off + 16 <= len(data):
+            wd, mask, _cookie, name_len = struct.unpack_from("iIII", data, off)
+            off += 16
+            raw = data[off : off + name_len].split(b"\x00", 1)[0]
+            off += name_len
+            name = os.fsdecode(raw) if raw else ""
+            parent = self.wds.get(wd, Path("."))
+            full = parent / name if name else parent
+            if mask & IN_Q_OVERFLOW:
+                changed = True
+                continue
+            if name and ignored(name, patterns):
+                continue
+            if mask & IN_CREATE and full.is_dir():
+                self.add_tree(full)
+            changed = True
+        return changed
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+
+def rclone_bin(cfg: dict) -> str:
+    return str(cfg.get("rclone") or "rclone")
+
+
+def rclone_cmd(cfg: dict) -> list[str]:
+    cmd = [
+        rclone_bin(cfg),
+        cfg["mode"],
+        str(cfg["local"]),
+        cfg["remote"],
+        "--retries",
+        "1",
+        "--low-level-retries",
+        "2",
+        "--stats",
+        "0",
+    ]
+    for pattern in cfg["ignore"]:
+        cmd.extend(["--exclude", pattern])
+    return cmd
+
+
+def upload(cfg: dict) -> bool:
+    delay = 2.0
+    for attempt in range(1, cfg["retries"] + 1):
+        if STOP:
+            return False
+        log(f"upload attempt {attempt} {cfg['mode']} {cfg['local']} -> {cfg['remote']}")
+        proc = subprocess.run(rclone_cmd(cfg), check=False)
+        if proc.returncode == 0:
+            log("upload ok")
+            return True
+        log(f"upload failed status {proc.returncode}")
+        if attempt < cfg["retries"]:
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+    return False
+
+
+def find_rclone() -> Optional[str]:
+    found = shutil.which("rclone")
+    if found:
+        return found
+    local = Path.home() / ".local" / "bin" / "rclone"
+    if local.is_file():
+        return str(local)
+    return None
+
+
+def list_remotes(rclone: str) -> list[str]:
+    proc = subprocess.run([rclone, "listremotes"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise SystemExit(proc.stderr.strip() or "rclone listremotes failed")
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def prompt(label: str, default: str) -> str:
+    if not sys.stdin.isatty():
+        return default
+    typed = input(f"{label} [{default}]: ").strip()
+    return typed or default
+
+
+def confirm_remote(rclone: str, name: str) -> None:
+    wanted = f"{name}:"
+    if wanted in list_remotes(rclone):
+        print(f"Using rclone remote {wanted}")
+        return
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            f"No rclone remote named {name}. On this machine run: rclone config\n"
+            f"Create a protondrive remote called {name}, then run: lane setup"
+        )
+    print()
+    print(f"There is no rclone remote named {name} yet.")
+    print("Next, rclone will sign you into Proton. It never sends your password to Lane.")
+    print(f"When it asks for a name, use {name}. When it asks for storage, choose protondrive.")
+    print("Quit the config wizard when that remote exists.")
+    print()
+    subprocess.run([rclone, "config"], check=False)
+    if wanted not in list_remotes(rclone):
+        raise SystemExit(f"Remote {wanted} still does not exist. Setup stopped before installing the service.")
+
+
+def write_config(folder: Path, remote: str, mode: str, debounce: float, rclone: str) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "local": str(folder),
+        "remote": remote,
+        "mode": mode,
+        "debounce_seconds": debounce,
+        "retries": 5,
+        "ignore": list(DEFAULT_IGNORE),
+        "rclone": rclone,
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def install_unit(start: bool) -> str:
+    path = unit_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(UNIT, encoding="utf-8")
+    desk = desktop_path()
+    desk.parent.mkdir(parents=True, exist_ok=True)
+    desk.write_text(DESKTOP, encoding="utf-8")
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        return "systemd is not available. The service file is installed; start Lane with: lane run"
+    subprocess.run([systemctl, "--user", "daemon-reload"], check=False)
+    if start:
+        proc = subprocess.run(
+            [systemctl, "--user", "enable", "--now", "lane.service"],
+            check=False,
+        )
+        if proc.returncode != 0:
+            return "Could not start the user service. If this is a server, try: loginctl enable-linger \"$USER\""
+        return "Lane is running in the background. It follows your login. For a machine with nobody logged in: loginctl enable-linger \"$USER\"\nLogs: journalctl --user -u lane.service -f"
+    subprocess.run([systemctl, "--user", "enable", "lane.service"], check=False)
+    return "Service installed. It will start at the next login, or run: systemctl --user start lane.service"
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    rclone = find_rclone()
+    if rclone is None:
+        print("rclone is not installed. Run install.sh — it downloads rclone into ~/.local/bin.", file=sys.stderr)
+        return 1
+    folder_text = args.folder or prompt("Folder to watch", str(Path.home() / "ProtonInbox"))
+    folder = Path(folder_text).expanduser()
+    drive_folder = args.drive_folder or prompt("Folder name inside Proton Drive", "Inbox")
+    remote_name = args.remote or prompt("rclone remote name", "proton")
+    mode = (args.mode or prompt("copy (never deletes on Drive) or sync (mirror, including deletes)", "copy")).lower()
+    if mode not in ("copy", "sync"):
+        print("Mode must be copy or sync.", file=sys.stderr)
+        return 1
+    if mode == "sync":
+        print("Sync removes files on Proton Drive that are not in this folder.")
+    debounce_text = args.debounce or prompt("Seconds to wait after the last change", "3")
+    try:
+        debounce = float(debounce_text)
+    except ValueError:
+        print("Settle time must be a number of seconds.", file=sys.stderr)
+        return 1
+    if debounce < 0.2:
+        print("Settle time is too small.", file=sys.stderr)
+        return 1
+    if not remote_name.replace("_", "").replace("-", "").isalnum():
+        print("Remote name should be a short rclone name such as proton.", file=sys.stderr)
+        return 1
+    drive_folder = drive_folder.strip().lstrip("/")
+    if not drive_folder or "\n" in drive_folder:
+        print("Drive folder name is required.", file=sys.stderr)
+        return 1
+    if mode == "sync" and not folder.is_dir():
+        print(f"Refusing to sync until this folder exists: {folder}", file=sys.stderr)
+        return 1
+    folder.mkdir(parents=True, exist_ok=True)
+    if not args.skip_remote:
+        confirm_remote(rclone, remote_name)
+    write_config(folder, f"{remote_name}:{drive_folder}", mode, debounce, rclone)
+    print(f"Config: {config_path()}")
+    print(install_unit(start=not args.no_start))
+    print(f"Drop files into {folder}. They upload after {debounce:g}s of quiet.")
+    return 0
+
+
+def cmd_run(_args: argparse.Namespace) -> int:
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+    try:
+        cfg = load()
+    except (OSError, json.JSONDecodeError, KeyError) as exc:
+        log(f"config error: {exc}")
+        return 1
+    local: Path = cfg["local"]
+    if not local.is_dir():
+        if cfg["mode"] == "sync":
+            log(f"refusing sync, folder does not exist: {local}")
+            return 1
+        local.mkdir(parents=True, exist_ok=True)
+        log(f"created {local}")
+    rclone = rclone_bin(cfg)
+    if shutil.which(rclone) is None and not Path(rclone).is_file():
+        log(f"rclone not found ({rclone})")
+        return 1
+    watcher = None
+    try:
+        watcher = Inotify(local)
+        log(f"watching {local} with inotify, mode {cfg['mode']}, quiet {cfg['debounce_seconds']}s")
+    except OSError as exc:
+        log(f"inotify unavailable ({exc}); polling every 2s")
+    dirty = True
+    quiet_at = time.monotonic()
+    last_snap: Optional[dict[str, tuple[int, int]]] = None
+    while not STOP:
+        if watcher is not None:
+            try:
+                if watcher.poll(0.4, cfg["ignore"]):
+                    dirty = True
+                    quiet_at = time.monotonic()
+            except OSError as exc:
+                log(f"inotify error ({exc}); switching to polling")
+                watcher.close()
+                watcher = None
+        else:
+            snap = snapshot(local, cfg["ignore"])
+            if last_snap is not None and snap != last_snap:
+                dirty = True
+                quiet_at = time.monotonic()
+            last_snap = snap
+            time.sleep(2)
+        if dirty and time.monotonic() - quiet_at >= cfg["debounce_seconds"]:
+            if upload(cfg):
+                dirty = False
+            else:
+                quiet_at = time.monotonic()
+    if watcher is not None:
+        watcher.close()
+    log("stopped")
+    return 0
+
+
+def service_state() -> str:
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        return "systemd not installed"
+    proc = subprocess.run(
+        [systemctl, "--user", "is-active", "lane.service"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return (proc.stdout or proc.stderr).strip() or "unknown"
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    path = config_path()
+    print(f"config: {path}")
+    if not path.is_file():
+        print("not configured. Run: lane setup")
+        return 1
+    cfg = load()
+    print(f"folder: {cfg['local']}")
+    print(f"drive:  {cfg['remote']}")
+    print(f"mode:   {cfg['mode']}")
+    print(f"quiet:  {cfg['debounce_seconds']}s")
+    print(f"service: {service_state()}")
+    return 0
+
+
+def cmd_uninstall(_args: argparse.Namespace) -> int:
+    systemctl = shutil.which("systemctl")
+    if systemctl is not None:
+        subprocess.run([systemctl, "--user", "disable", "--now", "lane.service"], check=False)
+    for path in (unit_path(), desktop_path(), config_path()):
+        if path.is_file():
+            path.unlink()
+            print(f"removed {path}")
+    print(f"Left the program at {bin_path()} and your watched folder untouched.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="lane", description="One-way Proton Drive folder sync for Linux.")
+    sub = parser.add_subparsers(dest="command")
+
+    setup = sub.add_parser("setup", help="choose the folder, sign in with rclone, install the service")
+    setup.add_argument("--folder")
+    setup.add_argument("--remote", help="rclone remote name, default proton")
+    setup.add_argument("--drive-folder", help="folder inside that remote")
+    setup.add_argument("--mode", choices=("copy", "sync"))
+    setup.add_argument("--debounce", help="seconds to wait after the last change")
+    setup.add_argument("--no-start", action="store_true", help="install the service without starting it")
+    setup.add_argument("--skip-remote", action="store_true", help=argparse.SUPPRESS)
+    setup.set_defaults(func=cmd_setup)
+
+    run = sub.add_parser("run", help="watch the folder until stopped")
+    run.set_defaults(func=cmd_run)
+
+    status = sub.add_parser("status", help="show config and service state")
+    status.set_defaults(func=cmd_status)
+
+    uninstall = sub.add_parser("uninstall", help="stop the service and remove its config")
+    uninstall.set_defaults(func=cmd_uninstall)
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 0
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
